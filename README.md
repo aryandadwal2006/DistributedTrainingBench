@@ -7,7 +7,7 @@ A small, reproducible benchmark for compact Transformer training and accelerator
 - Training: eager PyTorch, `torch.compile` / Inductor, optional Triton SiLU, mixed precision, gradient checkpointing.
 - Parallelism: single process, DistributedDataParallel (DDP), FullyShardedDataParallel (FSDP), tensor parallel MLPs, and a minimal GPipe-style pipeline split.
 - Communication: blocking versus asynchronous NCCL/Gloo all-reduce with independent matrix-multiply work between launch and wait.
-- Hardware: step time, global tokens/second, parameter count, CUDA allocated/reserved/peak memory, device properties, and runtime versions.
+- Hardware: step time, global tokens/second, parameter count, CUDA allocated/reserved/peak memory, device properties, an optional small/large-buffer copy-bandwidth probe, and runtime versions.
 - Profiling: PyTorch profiler Chrome traces and NVTX ranges for Nsight Systems.
 - Deployment: Docker, Kubernetes Job, and OpenShift Job examples.
 
@@ -66,13 +66,13 @@ Results are appended to `outputs/results.csv`. A JSON summary is printed by rank
 
 ## Compare eager, Inductor, and Triton
 
-Run the same compact workload in four configurations:
+Run the same compact workload in three configurations:
 
 ```bash
 bash scripts/compare.sh
 ```
 
-The script runs eager PyTorch, `torch.compile` / Inductor, Triton activation, and compiled Triton activation. It expects one CUDA device. Set `DEVICE=cuda`, `STEPS=50`, or other supported CLI values to adjust the workload. Triton runs require `requirements-triton.txt`.
+The script runs eager PyTorch, `torch.compile` / Inductor, and the Triton activation. It expects one CUDA device. Edit the `DEVICE`, `STEPS`, and `WARMUP` values at the top of the script to adjust the workload. Triton runs require `requirements-triton.txt`.
 
 Equivalent individual runs:
 
@@ -80,7 +80,6 @@ Equivalent individual runs:
 python -m bench.train --device cuda --kernel torch
 python -m bench.train --device cuda --compile --kernel torch
 python -m bench.train --device cuda --kernel triton
-python -m bench.train --device cuda --compile --kernel triton
 ```
 
 Compilation is warmed up before measured steps. Compare runs on an otherwise idle device with identical model and workload settings. The first compiled iteration is not included in the reported steady-state timing.
@@ -137,6 +136,14 @@ python -m bench.train --device cuda --checkpointing --dtype bf16
 
 The model dimensions, batch size, sequence length, warmup count, and measured step count are CLI options. Increase dimensions gradually to avoid out-of-memory errors.
 
+Run an optional small/large-buffer CUDA copy probe to compare a cache-sized working set with a larger allocation:
+
+```bash
+python -m bench.train --device cuda --memory-benchmark
+```
+
+The result records the reported L2 cache size and effective copy bandwidth for both buffer sizes. This is a lightweight probe, not a substitute for hardware performance counters.
+
 ## Communication-computation overlap
 
 On a distributed run, compare blocking all-reduce with asynchronous all-reduce while a matrix multiplication executes before `work.wait()`:
@@ -176,7 +183,7 @@ docker run --rm --gpus all distributed-training-bench:local --device cuda --step
 Run distributed workers in the container:
 
 ```bash
-docker run --rm --gpus all --ipc=host distributed-training-bench:local --device cuda --parallel dp --steps 20
+docker run --rm --gpus all --ipc=host --entrypoint torchrun distributed-training-bench:local --standalone --nproc_per_node=2 -m bench.train --device cuda --parallel dp --steps 20
 ```
 
 For multi-process distributed execution, invoke the image through `torchrun` (see the Kubernetes manifests) or override the container entrypoint.
@@ -226,6 +233,7 @@ The OpenShift project must have permission to request the `nvidia.com/gpu` resou
 --output-dir PATH
 --profile
 --profile-steps N
+--memory-benchmark
 --comm-benchmark
 --comm-mb FLOAT
 ```

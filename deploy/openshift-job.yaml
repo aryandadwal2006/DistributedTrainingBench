@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training-bench
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: distributed-training-bench
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: benchmark
+          image: distributed-training-bench:latest
+          imagePullPolicy: IfNotPresent
+          command: ["torchrun"]
+          args:
+            - "--standalone"
+            - "--nnodes=1"
+            - "--nproc_per_node=2"
+            - "-m"
+            - "bench.train"
+            - "--device"
+            - "cuda"
+            - "--parallel"
+            - "dp"
+            - "--steps"
+            - "50"
+            - "--dtype"
+            - "bf16"
+          resources:
+            limits:
+              nvidia.com/gpu: 2
+            requests:
+              nvidia.com/gpu: 2
