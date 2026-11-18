@@ -51,7 +51,7 @@ def build_record(
     args,
     runtime,
     elapsed: float,
-    loss: float,
+    loss: float | None,
     parameter_count: int,
     peak_allocated: int | None = None,
     peak_reserved: int | None = None,
@@ -59,6 +59,7 @@ def build_record(
     data_parallel_factor = runtime.world_size if args.parallel in {"dp", "fsdp"} else 1
     token_count = args.batch_size * args.seq_len * args.steps * data_parallel_factor
     record = {
+        "task": args.task,
         "parallel": args.parallel,
         "world_size": runtime.world_size,
         "kernel": args.kernel,

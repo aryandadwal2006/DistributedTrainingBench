@@ -25,6 +25,7 @@ from bench.pipeline import train_pipeline
 
 def parse_args():
     parser = argparse.ArgumentParser(description="distributed compact-Transformer benchmark")
+    parser.add_argument("--task", choices=("train", "infer"), default="train")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--parallel", choices=("none", "dp", "fsdp", "tp", "pp"), default="none")
     parser.add_argument("--kernel", choices=("torch", "triton"), default="torch")
@@ -72,6 +73,12 @@ def parse_args():
         parser.error("--compile with --kernel triton is not supported; benchmark these paths separately")
     if args.parallel == "tp" and args.kernel == "triton":
         parser.error("the Triton activation is not supported with tensor parallel DTensors")
+    if args.task == "infer" and args.parallel != "none":
+        parser.error("inference mode uses independent single-process replicas; use --parallel none")
+    if args.task == "infer" and args.checkpointing:
+        parser.error("--checkpointing applies only to training")
+    if args.task == "infer" and args.comm_benchmark:
+        parser.error("--comm-benchmark applies only to distributed training")
     return args
 
 
@@ -101,26 +108,64 @@ def make_autocast(runtime, precision):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
-def train_standard(args, runtime, config) -> dict:
+def make_model(args, runtime, config):
     if args.kernel == "triton":
         if runtime.device.type != "cuda":
             raise RuntimeError("the Triton activation requires --device cuda")
         if not TRITON_AVAILABLE:
             raise RuntimeError("Triton is unavailable; install requirements-triton.txt")
 
-    if args.parallel == "tp" and config.intermediate_size % runtime.world_size != 0:
-        raise RuntimeError("tensor parallel world size must divide the MLP intermediate size")
-
     seed_everything(args.seed)
     model = DistributedTrainingModel(config, kernel=args.kernel).to(runtime.device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    return model, parameter_count
+
+
+def compile_model(model, args):
+    if not args.compile:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is unavailable in this PyTorch version")
+    return torch.compile(model, backend="inductor", mode=args.compile_mode)
+
+
+def profile_activities(runtime):
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if runtime.device.type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
+def export_profile(args, runtime, step_fn):
+    trace_path = Path(args.output_dir) / f"profile-rank{runtime.rank}.json"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    schedule = torch.profiler.schedule(
+        wait=0,
+        warmup=0,
+        active=min(args.profile_steps, args.steps),
+        repeat=1,
+    )
+    with torch.profiler.profile(
+        activities=profile_activities(runtime),
+        schedule=schedule,
+        record_shapes=True,
+        profile_memory=True,
+        on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path)),
+    ) as profiler:
+        last_value = None
+        for _ in range(args.steps):
+            last_value = step_fn()
+            profiler.step()
+    return last_value
+
+
+def train_standard(args, runtime, config) -> dict:
+    if args.parallel == "tp" and config.intermediate_size % runtime.world_size != 0:
+        raise RuntimeError("tensor parallel world size must divide the MLP intermediate size")
+
+    model, parameter_count = make_model(args, runtime, config)
     model = wrap_model(model, args.parallel, runtime)
-
-    if args.compile:
-        if not hasattr(torch, "compile"):
-            raise RuntimeError("torch.compile is unavailable in this PyTorch version")
-        model = torch.compile(model, backend="inductor", mode=args.compile_mode)
-
+    model = compile_model(model, args)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler(
@@ -164,39 +209,17 @@ def train_standard(args, runtime, config) -> dict:
     if runtime.distributed:
         dist.barrier()
 
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if runtime.device.type == "cuda":
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
     last_loss = torch.zeros((), device=runtime.device)
     start = time.perf_counter()
     if args.profile:
-        trace_path = Path(args.output_dir) / f"profile-rank{runtime.rank}.json"
-        trace_path.parent.mkdir(parents=True, exist_ok=True)
-        schedule = torch.profiler.schedule(
-            wait=0,
-            warmup=0,
-            active=min(args.profile_steps, args.steps),
-            repeat=1,
-        )
-        with torch.profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            record_shapes=True,
-            profile_memory=True,
-            on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(trace_path)),
-        ) as profiler:
-            for _ in range(args.steps):
-                last_loss = train_step()
-                profiler.step()
+        last_loss = export_profile(args, runtime, train_step)
     else:
         for _ in range(args.steps):
             last_loss = train_step()
 
     if runtime.device.type == "cuda":
         torch.cuda.synchronize(runtime.device)
-    elapsed = time.perf_counter() - start
-    elapsed = distributed_max(elapsed, runtime)
+    elapsed = distributed_max(time.perf_counter() - start, runtime)
 
     if runtime.distributed:
         dist.all_reduce(last_loss, op=dist.ReduceOp.SUM)
@@ -234,6 +257,79 @@ def train_standard(args, runtime, config) -> dict:
     return record
 
 
+def run_inference(args, runtime, config) -> dict:
+    model, parameter_count = make_model(args, runtime, config)
+    model = compile_model(model, args)
+    model.eval()
+
+    generator = torch.Generator(device=runtime.device)
+    generator.manual_seed(args.seed)
+
+    def inference_step():
+        tokens = torch.randint(
+            0,
+            args.vocab_size,
+            (args.batch_size, args.seq_len),
+            generator=generator,
+            device=runtime.device,
+        )
+        if runtime.device.type == "cuda":
+            torch.cuda.nvtx.range_push("inference_step")
+        try:
+            with torch.inference_mode():
+                with torch.autograd.profiler.record_function("inference_step"):
+                    with make_autocast(runtime, args.dtype):
+                        _, logits = model(tokens)
+        finally:
+            if runtime.device.type == "cuda":
+                torch.cuda.nvtx.range_pop()
+        return logits
+
+    for _ in range(args.warmup):
+        inference_step()
+
+    if runtime.device.type == "cuda":
+        torch.cuda.synchronize(runtime.device)
+        torch.cuda.reset_peak_memory_stats(runtime.device)
+
+    start = time.perf_counter()
+    if args.profile:
+        inference_step_result = export_profile(args, runtime, inference_step)
+    else:
+        inference_step_result = None
+        for _ in range(args.steps):
+            inference_step_result = inference_step()
+
+    if runtime.device.type == "cuda":
+        torch.cuda.synchronize(runtime.device)
+    elapsed = time.perf_counter() - start
+
+    peak_allocated = (
+        torch.cuda.max_memory_allocated(runtime.device)
+        if runtime.device.type == "cuda"
+        else 0
+    )
+    peak_reserved = (
+        torch.cuda.max_memory_reserved(runtime.device)
+        if runtime.device.type == "cuda"
+        else 0
+    )
+
+    record = build_record(
+        args=args,
+        runtime=runtime,
+        elapsed=elapsed,
+        loss=None,
+        parameter_count=parameter_count,
+        peak_allocated=peak_allocated,
+        peak_reserved=peak_reserved,
+    )
+    if args.memory_benchmark:
+        record["memory_hierarchy"] = benchmark_memory(runtime)
+    write_record(args.output_dir, record)
+    return record
+
+
 def main():
     args = parse_args()
     runtime = initialize_runtime(args.device)
@@ -242,11 +338,13 @@ def main():
             raise RuntimeError("torchrun detected multiple processes; select a distributed --parallel mode")
         if args.parallel != "none" and not runtime.distributed:
             raise RuntimeError(f"--parallel {args.parallel} requires torchrun with at least two processes")
-        if args.parallel == "pp":
-            config = make_config(args)
+
+        config = make_config(args)
+        if args.task == "infer":
+            record = run_inference(args, runtime, config)
+        elif args.parallel == "pp":
             record = train_pipeline(args, runtime, config)
         else:
-            config = make_config(args)
             record = train_standard(args, runtime, config)
 
         if args.comm_benchmark:

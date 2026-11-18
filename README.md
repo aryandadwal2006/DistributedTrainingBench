@@ -4,7 +4,7 @@ A small, reproducible benchmark for compact Transformer training and accelerator
 
 ## What it measures
 
-- Training: eager PyTorch, `torch.compile` / Inductor, optional Triton SiLU, mixed precision, gradient checkpointing.
+- Training and inference: compact causal Transformer workloads, eager PyTorch, `torch.compile` / Inductor, optional Triton SiLU, mixed precision, and gradient checkpointing.
 - Parallelism: single process, DistributedDataParallel (DDP), FullyShardedDataParallel (FSDP), tensor parallel MLPs, and a minimal GPipe-style pipeline split.
 - Communication: blocking versus asynchronous NCCL/Gloo all-reduce with independent matrix-multiply work between launch and wait.
 - Hardware: step time, global tokens/second, parameter count, CUDA allocated/reserved/peak memory, device properties, an optional small/large-buffer copy-bandwidth probe, and runtime versions.
@@ -56,11 +56,19 @@ A CPU smoke test:
 python -m bench.train --device cpu --steps 5 --warmup 1 --batch-size 2 --seq-len 32 --hidden-size 64 --layers 2 --heads 4
 ```
 
-A single-GPU run:
+A single-GPU training run:
 
 ```bash
 python -m bench.train --device cuda --steps 50 --warmup 10 --dtype bf16
 ```
+
+A single-GPU inference throughput run:
+
+```bash
+python -m bench.train --task infer --device cuda --steps 100 --warmup 10 --dtype fp16
+```
+
+Inference uses locally initialized synthetic model weights and synthetic tokens. It measures forward-pass throughput and latency, not task quality or pretrained-model performance. No checkpoint download is performed.
 
 Results are appended to `outputs/results.csv`. A JSON summary is printed by rank zero. Each run records its parallel mode, kernel, compiler setting, precision, throughput, latency, memory, and device metadata.
 
@@ -83,6 +91,16 @@ python -m bench.train --device cuda --kernel triton
 ```
 
 Compilation is warmed up before measured steps. Compare runs on an otherwise idle device with identical model and workload settings. The first compiled iteration is not included in the reported steady-state timing.
+
+## Inference benchmarking
+
+Inference is a separate forward-only path. It supports eager execution, `torch.compile` / Inductor, FP16/BF16 autocast, Triton activation, profiler traces, and the optional CUDA memory probe. It runs as a single process per GPU replica:
+
+```bash
+python -m bench.train --task infer --device cuda --batch-size 8 --seq-len 128 --steps 100 --warmup 10
+```
+
+The result CSV distinguishes `train` and `infer` runs. Inference uses random local weights unless the implementation is extended with a checkpoint loader; do not interpret its output as model-quality evaluation.
 
 ## Distributed training
 
@@ -178,6 +196,7 @@ Build and run on a host with the NVIDIA Container Toolkit:
 ```bash
 docker build -t distributed-training-bench:local .
 docker run --rm --gpus all distributed-training-bench:local --device cuda --steps 20 --warmup 5
+docker run --rm --gpus all distributed-training-bench:local --task infer --device cuda --steps 100 --warmup 10
 ```
 
 Run distributed workers in the container:
@@ -197,7 +216,7 @@ kubectl apply -f deploy/kubernetes-job.yaml
 kubectl logs -f job/distributed-training-bench
 ```
 
-The manifest requests two NVIDIA GPUs and launches two local DDP workers. The cluster must have the NVIDIA device plugin or GPU Operator installed, and the image must be available to the cluster.
+The training manifest requests two NVIDIA GPUs and launches two local DDP workers. The inference manifest requests one GPU and runs a forward-only workload. The cluster must have the NVIDIA device plugin or GPU Operator installed, and the image must be available to the cluster.
 
 ## OpenShift
 
@@ -208,11 +227,12 @@ oc apply -f deploy/openshift-job.yaml
 oc logs -f job/distributed-training-bench
 ```
 
-The OpenShift project must have permission to request the `nvidia.com/gpu` resource and pull the image. Adapt the service account and image-pull policy to the cluster's security policies.
+The training manifest requests two NVIDIA GPUs for DDP; the inference manifest requests one GPU for a forward-only run. The OpenShift project must have permission to request the `nvidia.com/gpu` resource and pull the image. Adapt the service account and image-pull policy to the cluster's security policies.
 
 ## CLI
 
 ```text
+--task {train,infer}
 --device {auto,cpu,cuda}
 --parallel {none,dp,fsdp,tp,pp}
 --kernel {torch,triton}

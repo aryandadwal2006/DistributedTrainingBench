@@ -1,0 +1,30 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training-bench-inference
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: inference-benchmark
+          image: distributed-training-bench:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "bench.train"]
+          args:
+            - "--task"
+            - "infer"
+            - "--device"
+            - "cuda"
+            - "--steps"
+            - "100"
+            - "--warmup"
+            - "10"
+            - "--dtype"
+            - "fp16"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
