@@ -23,6 +23,7 @@ class BenchmarkConfig(PretrainedConfig):
         gradient_checkpointing: bool = False,
         **kwargs,
     ):
+        kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads")
@@ -101,6 +102,18 @@ class DistributedTrainingModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.token_embedding
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.token_embedding = value
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, value: nn.Module) -> None:
+        self.lm_head = value
 
     def forward(
         self,
